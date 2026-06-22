@@ -1,0 +1,27 @@
+{
+  "name": "sus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SUS, the Simplest Underlay Server. A complete Underlay node in one zero-dependency file.",
+  "type": "module",
+  "scripts": {
+    "start": "node sus.mjs",
+    "lint": "oxlint .",
+    "fmt": "oxfmt",
+    "fmt:check": "oxfmt --check",
+    "secrets:encrypt:prod": "sops -e --input-type dotenv --output-type dotenv --output .env.prod.enc .env.prod",
+    "secrets:decrypt:prod": "sops -d --input-type dotenv --output-type dotenv --output .env.prod .env.prod.enc"
+  },
+  "devDependencies": {
+    "lint-staged": "^17.0.4",
+    "oxfmt": "latest",
+    "oxlint": "latest",
+    "simple-git-hooks": "^2.13.1"
+  },
+  "simple-git-hooks": {
+    "pre-commit": "pnpm lint-staged"
+  },
+  "lint-staged": {
+    "*.{mjs,js,json}": "oxfmt --"
+  }
+}

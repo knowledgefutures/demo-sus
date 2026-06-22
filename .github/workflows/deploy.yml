@@ -1,0 +1,94 @@
+name: Deploy
+
+run-name: 'Deploy SUS: ${{ github.sha }}'
+
+concurrency:
+  group: deploy-sus
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Syntax check
+        run: node --check sus.mjs
+
+      - name: Install sops
+        run: |
+          curl -LO https://github.com/getsops/sops/releases/download/v3.9.4/sops-v3.9.4.linux.amd64
+          sudo mv sops-v3.9.4.linux.amd64 /usr/local/bin/sops
+          sudo chmod +x /usr/local/bin/sops
+
+      # The deploy target lives encrypted in .env.prod.enc. Decrypt it here with
+      # the team age key to learn which host to ship to (keeps the IP out of git).
+      - name: Extract DEPLOY_HOST from encrypted env
+        id: host
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          DEPLOY_HOST=$(sops -d --input-type dotenv --output-type dotenv .env.prod.enc | grep '^DEPLOY_HOST=' | cut -d= -f2)
+          if [[ -z "$DEPLOY_HOST" ]]; then
+            echo "::error::DEPLOY_HOST not found in .env.prod.enc"
+            exit 1
+          fi
+          echo "deploy_host=${DEPLOY_HOST}" >> "$GITHUB_OUTPUT"
+
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ steps.host.outputs.deploy_host }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      # SUS has no runtime secrets, so the box just needs the repo + Docker.
+      # Build on the host with docker compose (the image is one file copied into
+      # node:24-slim, so building there is faster than pushing through a registry).
+      - name: Deploy over SSH
+        env:
+          SSH_USER: ${{ secrets.SSH_USER }}
+          DEPLOY_HOST: ${{ steps.host.outputs.deploy_host }}
+        run: |
+          ssh "${SSH_USER}@${DEPLOY_HOST}" 'bash -s' <<'EOS'
+          set -euo pipefail
+
+          APP_DIR="/srv/sus"
+          # Public demo repo, so an unauthenticated HTTPS clone works. If the
+          # repo is made private, switch to git@github.com and add a deploy key.
+          REPO_URL="https://github.com/knowledgefutures/demo-sus.git"
+          BRANCH="main"
+
+          if [[ ! -d "${APP_DIR}/.git" ]]; then
+            sudo mkdir -p "${APP_DIR}"
+            sudo chown -R "$USER:$USER" "${APP_DIR}"
+            git clone --branch "${BRANCH}" "${REPO_URL}" "${APP_DIR}"
+          fi
+
+          cd "${APP_DIR}"
+          git fetch --prune origin
+          git checkout "${BRANCH}"
+          git reset --hard "origin/${BRANCH}"
+
+          sudo docker compose up -d --build
+          sudo docker image prune -f
+          sudo docker compose ps
+          EOS

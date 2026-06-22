@@ -1,0 +1,28 @@
+# Deploy SUS the same way as our other Hetzner services: Docker behind the
+# host-level Caddy. Caddy reverse-proxies to 127.0.0.1:<port> (see
+# Caddyfile.example), so we publish only on the loopback interface.
+#
+#   docker compose up -d --build
+#
+# Continues the underlay port series (dev=3000, www=3001, mirror=3002).
+services:
+  sus:
+    build: .
+    image: sus
+    restart: unless-stopped
+    # 127.0.0.1 only. Caddy on the host terminates TLS and proxies in.
+    ports:
+      - '127.0.0.1:3003:8080'
+    environment:
+      PORT: '8080'
+      SUS_DATA: /data
+      # Reject pushes once the content store reaches this size. 1 GiB.
+      SUS_MAX_BYTES: '1073741824'
+    volumes:
+      - sus-data:/data
+    # Resource caps so it stays modest on the shared box.
+    mem_limit: 256m
+    cpus: 0.5
+
+volumes:
+  sus-data:

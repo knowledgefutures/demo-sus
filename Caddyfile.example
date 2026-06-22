@@ -1,0 +1,12 @@
+# Add this block to the host-level Caddyfile (/etc/caddy/Caddyfile) on the
+# Hetzner box, then: systemctl reload caddy
+#
+# NOTE: Use 127.0.0.1 (not localhost). Docker publishes on IPv4 only.
+
+# `tls internal` matches the existing underlay Caddyfile on this box (real TLS
+# is terminated upstream). If this host instead faces the internet directly,
+# drop the tls line and Caddy will get a Let's Encrypt cert automatically.
+sus.knowledgefutures.org {
+    tls internal
+    reverse_proxy 127.0.0.1:3003
+}

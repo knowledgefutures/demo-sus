@@ -1,6 +1,11 @@
 node_modules/
 dist/
+sus-data/
 .env
 .env.local
+.env.prod
+.env.dev
 *.local
 .DS_Store
+
+# Decrypted secrets stay local; only the .enc files are committed.
