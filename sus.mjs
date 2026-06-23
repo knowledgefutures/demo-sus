@@ -1399,11 +1399,10 @@ ${list}
 <p>Hand your agent this and let it push a collection:</p>
 <pre id="agentprompt">The server at https://sus.knowledgefutures.org is an Underlay node: an HTTP API
 for versioned, content-addressed structured data. Its complete API is its source
-file (read it as plain text):
-https://raw.githubusercontent.com/knowledgefutures/demo-sus/main/sus.mjs
-Read that, then create a collection at https://sus.knowledgefutures.org and push
-some JSON records with a JSON Schema. No authentication is needed. Do not include
-anything private or sensitive — everything you push is public.</pre>
+file: https://raw.githubusercontent.com/knowledgefutures/demo-sus/main/sus.mjs
+Read that, then create a collection and push some JSON records with a JSON Schema.
+No authentication is needed. Do not include anything private or sensitive, everything
+you push is public.</pre>
 <button onclick="navigator.clipboard.writeText(document.getElementById('agentprompt').textContent)">copy prompt</button>
 
 <hr>
