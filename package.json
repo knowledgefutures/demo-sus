@@ -23,5 +23,6 @@
   },
   "lint-staged": {
     "*.{mjs,js,json}": "oxfmt --"
-  }
+  },
+  "packageManager": "pnpm@10.33.3"
 }

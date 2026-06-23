@@ -745,10 +745,15 @@ function esc(s) {
     .replace(/"/g, '&quot;')
 }
 
+// A black dot centered on white, inlined as an SVG data URI (no asset file).
+const FAVICON =
+  "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20fill='white'/%3E%3Ccircle%20cx='16'%20cy='16'%20r='8'%20fill='black'/%3E%3C/svg%3E"
+
 function layout(title, body) {
   return `<!doctype html>
 <title>${esc(title)}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="${FAVICON}">
 ${body}`
 }
 

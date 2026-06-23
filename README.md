@@ -1,16 +1,13 @@
 # SUS · the Simplest Underlay Server
 
-A complete [Underlay](https://underlay.org) server in **one file**, with **zero
-dependencies**. The whole protocol (content-addressed records and schemas,
+A complete [Underlay](https://underlay.org) server in one file, with zero
+dependencies. The whole protocol (content-addressed records and schemas,
 derived semantic versioning, public/private hashing), plus an HTTP API and a
 plain HTML console, all in `sus.mjs`.
 
 ```bash
 node sus.mjs        # serves http://localhost:8080
 ```
-
-No `npm install`, no build step, no database, no cloud services. It runs on a
-stock Node (v18+) and stores everything as files on disk.
 
 A public instance runs at **[sus.knowledgefutures.org](https://sus.knowledgefutures.org)**.
 
@@ -144,7 +141,7 @@ The push response reports the derived version, the semver bump, and how much
 content was deduplicated. Note that `publicHash` differs from `hash` because the
 private `email` field is excluded from the public address.
 
-## What SUS leaves out (on purpose)
+## What SUS intentionally leaves out
 
 To stay "simplest," SUS omits everything the protocol does **not** require:
 
@@ -187,13 +184,7 @@ SUS ships with Docker behind a host-level Caddy on any vm. See [`docker-compose.
 docker compose up -d --build
 ```
 
-This publishes the server on `127.0.0.1:3003` (container port `8080`) and
-persists the content store in the `sus-data` named volume. The compose file also
-caps memory (`256m`), CPU (`0.5`), and the content store (`SUS_MAX_BYTES`, 1 GB;
-pushes are refused once it's full). Add a block to the host Caddyfile (see
-[`Caddyfile.example`](./Caddyfile.example)) to expose it. The `tls internal` line
-matches the existing underlay Caddyfile, where real TLS is terminated upstream;
-drop it if this host faces the internet directly:
+This publishes the server on `127.0.0.1:3003` (container port `8080`) and persists the content store in the `sus-data` named volume. The compose file also caps memory (`256m`), CPU (`0.5`), and the content store (`SUS_MAX_BYTES`, 1 GB; pushes are refused once it's full). Add a block to the host Caddyfile (see [`Caddyfile.example`](./Caddyfile.example)) to expose it. The `tls internal` line matches the existing underlay Caddyfile, where real TLS is terminated upstream; drop it if this host faces the internet directly:
 
 ```
 sus.knowledgefutures.org {
@@ -206,11 +197,7 @@ Then `systemctl reload caddy`.
 
 ### Continuous deployment (GitHub Actions)
 
-[`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml) deploys on every
-push to `main` (and on manual dispatch). It mirrors the underlay setup: the
-deploy target is kept out of git in an sops-encrypted env file, decrypted in CI
-to learn which host to ship to. The workflow then SSHes to the box, pulls the
-repo into `/srv/sus`, and runs `docker compose up -d --build`.
+[`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml) deploys on every push to `main` (and on manual dispatch). It mirrors the underlay setup: the deploy target is kept out of git in an sops-encrypted env file, decrypted in CI to learn which host to ship to. The workflow then SSHes to the box, pulls the repo into `/srv/sus`, and runs `docker compose up -d --build`.
 
 One-time setup:
 
