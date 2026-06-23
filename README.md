@@ -54,8 +54,9 @@ exactly the same as it would on the real server.
 - **Semver is derived, not chosen.** A schema change bumps major, a records
   change bumps minor, a metadata-only change bumps patch.
 - **Public vs private hash.** Fields or whole types marked `"private": true` are
-  stripped and re-hashed into a `publicHash` that can be shared without leaking
-  private data.
+  stripped and re-hashed into a separate `publicHash` that can be shared without
+  leaking private data. (This demo has no auth and serves the full owner view, so
+  the data itself is not hidden on read — see [Protocol compliance](#protocol-compliance).)
 
 ### On-disk layout
 
@@ -65,6 +66,7 @@ The filesystem is the database. Deduplication is just "does this file exist?"
 sus-data/
   records/<sha256>.json          one record object { id, type, data }
   schemas/<sha256>.json          one schema body
+  files/<sha256>                 one binary blob (+ <sha256>.type)
   collections/<owner>/<slug>/
     meta.json                    { name, public, createdAt }
     v1.0.0.json                  a version manifest (lists the hashes above)
@@ -90,18 +92,49 @@ The same data is available as JSON under `/api`:
 
 ## API
 
-| Method   | Path                                                     | Body                                               |
-| -------- | -------------------------------------------------------- | -------------------------------------------------- |
-| `GET`    | `/api/health`                                            | (also reports storage used / cap)                  |
-| `GET`    | `/api/collections`                                       |                                                    |
-| `POST`   | `/api/collections`                                       | `{ owner, slug, name }`                            |
-| `GET`    | `/api/collections/:owner/:slug`                          |                                                    |
-| `DELETE` | `/api/collections/:owner/:slug`                          | no auth; garbage-collects orphaned records/schemas |
-| `POST`   | `/api/collections/:owner/:slug/push`                     | `{ schemas, records, message }`                    |
-| `GET`    | `/api/collections/:owner/:slug/versions/:semver`         | (`:semver` may be `latest`)                        |
-| `GET`    | `/api/collections/:owner/:slug/versions/:semver/records` |                                                    |
-| `GET`    | `/api/records/:hash`                                     |                                                    |
-| `GET`    | `/api/schemas/:hash`                                     |                                                    |
+Collections:
+
+| Method   | Path                                 | Body                              |
+| -------- | ------------------------------------ | --------------------------------- |
+| `GET`    | `/api/health`                        | (also reports storage used / cap) |
+| `GET`    | `/api/collections`                   |                                   |
+| `POST`   | `/api/collections`                   | `{ owner, slug, name }`           |
+| `GET`    | `/api/collections/:owner/:slug`      |                                   |
+| `DELETE` | `/api/collections/:owner/:slug`      | garbage-collects orphaned content |
+| `POST`   | `/api/collections/:owner/:slug/fork` | `{ targetOrg, slug? }`            |
+
+Push (negotiate protocol):
+
+| Method   | Path                                                           | Body                                         |
+| -------- | -------------------------------------------------------------- | -------------------------------------------- |
+| `POST`   | `/api/collections/:owner/:slug/versions/negotiate`             | `{ base_version, schemas, manifest, files }` |
+| `POST`   | `/api/collections/:owner/:slug/versions/negotiate/:id/records` | NDJSON records                               |
+| `POST`   | `/api/collections/:owner/:slug/versions/negotiate/:id/commit`  |                                              |
+| `GET`    | `/api/collections/:owner/:slug/versions/negotiate/:id`         | session status                               |
+| `DELETE` | `/api/collections/:owner/:slug/versions/negotiate/:id`         | cancel session                               |
+| `POST`   | `/api/collections/:owner/:slug/push`                           | one-shot convenience over the above          |
+
+Pull / read:
+
+| Method | Path                                                        | Notes                       |
+| ------ | ----------------------------------------------------------- | --------------------------- |
+| `GET`  | `/api/collections/:owner/:slug/versions/:semver`            | (`:semver` may be `latest`) |
+| `GET`  | `/api/collections/:owner/:slug/versions/:semver/manifest`   | `?since=` for a delta       |
+| `GET`  | `/api/collections/:owner/:slug/versions/:semver/diff?from=` | added / updated / removed   |
+| `GET`  | `/api/collections/:owner/:slug/versions/:semver/records`    |                             |
+| `GET`  | `/api/collections/:owner/:slug/versions/:semver/files`      |                             |
+| `POST` | `/api/records/batch`                                        | `{ hashes }` → NDJSON       |
+| `GET`  | `/api/records/:hash`                                        |                             |
+| `GET`  | `/api/records/:hash/provenance`                             |                             |
+| `GET`  | `/api/schemas/:hash`                                        |                             |
+
+Files (content-addressed blobs):
+
+| Method | Path                                               | Notes                        |
+| ------ | -------------------------------------------------- | ---------------------------- |
+| `PUT`  | `/api/collections/:owner/:slug/files/sha256:<hex>` | upload; server verifies hash |
+| `GET`  | `/api/collections/:owner/:slug/files/:hash`        | download                     |
+| `HEAD` | `/api/collections/:owner/:slug/files/:hash`        | existence + size + type      |
 
 ### Example
 
@@ -141,22 +174,42 @@ The push response reports the derived version, the semver bump, and how much
 content was deduplicated. Note that `publicHash` differs from `hash` because the
 private `email` field is excluded from the public address.
 
-## What SUS intentionally leaves out
+## Protocol compliance
 
-To stay "simplest," SUS omits everything the protocol does **not** require:
+SUS implements the full [Underlay protocol](https://underlay.org/protocol):
 
-- **Auth, organizations, API keys.** Everything is open; ownership is just a slug.
+- **Data model:** records, schemas, versions, and files, all content-addressed
+  and globally deduplicated.
+- **Identity:** record hashing, the `private:`/`public:` version hashes, and
+  public-hash addressing (records of a type with private fields are listed and
+  served under their filtered public hash). Hashes are byte-identical to the
+  reference server.
+- **Push:** the negotiate protocol (`negotiate` → send records as NDJSON →
+  `commit`), with optimistic locking on `base_version` (409 on conflict),
+  unknown-field rejection (422) and `strip_unknown_fields`, and missing-file
+  detection (422). `POST .../push` is a one-shot convenience that funnels
+  through the same commit path.
+- **Pull:** full and delta (`?since=`) manifests, `diff?from=`, and
+  `POST /api/records/batch` as an NDJSON stream.
+- **Files:** `PUT` with server-side hash verification, `GET`/`HEAD`, dedup, and
+  `{"$file":"sha256:..."}` references resolved at commit time.
+- **Provenance** and **fork** (manifest-only copy via `forkedFrom`).
+
+### What it leaves out (platform, not protocol)
+
+- **Auth, organizations, API keys, rate limits.** Everything is open; ownership
+  is just a slug. Since anyone can already read, write, and delete, SUS treats
+  **every caller as the owner** and serves the full view: private types,
+  records, and fields are all returned. The `private:`/`public:` version hashes
+  are still computed and the filtered public documents are still stored (so a
+  record resolves by either its private or its public hash), but on this
+  unauthenticated demo, marking data private does **not** hide it on read.
+  Don't push anything you wouldn't publish.
 - **Postgres and S3.** The filesystem is the store.
-- **The negotiate handshake.** The real server uses a two-phase
-  `negotiate, upload-missing, commit` flow so clients never re-upload content
-  the server already has. SUS pushes everything in one shot and _reports_ what
-  it deduplicated, which shows the same content-addressing behavior.
 - **Full JSON-Schema validation.** Replaced by a ~30-line structural check
   (required fields present, declared primitive types match).
 - **ARK identifiers, mirror sync, the SQL query console, discussion threads.**
-
-These are deployment and product concerns layered on top of the protocol, not
-the protocol itself.
+  Platform features layered on top of the protocol.
 
 ## Development
 

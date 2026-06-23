@@ -19,21 +19,28 @@
 //   on canonicalization produce byte-identical version hashes and can exchange
 //   collections. A version pushed here hashes the same as on the real server.
 //
-// WHAT THIS LEAVES OUT (on purpose, to stay "simplest")
-//   - Auth / orgs / API keys     -> everything is open; ownership is just a slug
-//   - Postgres + S3              -> the filesystem is the store (hash = filename)
-//   - The negotiate handshake    -> the real server has a two-phase
-//                                   negotiate -> upload-missing -> commit flow so
-//                                   clients never re-upload content the server
-//                                   already has. SUS pushes everything in one
-//                                   shot and reports what it deduplicated, which
-//                                   shows the same content-addressing behavior.
-//   - ajv JSON-Schema validation -> replaced by a ~30-line structural check
+// WHAT THIS IMPLEMENTS
+//   The full Underlay protocol (underlay.org/protocol): the four primitives
+//   (records, schemas, versions, files); record and version identity including
+//   public-hash addressing; the negotiate push (negotiate -> send records ->
+//   commit); pull (manifest, delta, /records/batch); schema semantics with
+//   unknown-field rejection / strip_unknown_fields; files; provenance; and
+//   collaboration (optimistic locking, diff, fork).
+//
+// WHAT THIS LEAVES OUT (platform, not protocol)
+//   - Auth / orgs / API keys / rate limits -> everything is open; ownership is
+//     just a slug. Since anyone can already read, write, and delete, SUS treats
+//     every caller as the owner and serves the full view (private types,
+//     records, and fields included). Public hashes are still computed and the
+//     filtered public documents are still stored, so a record resolves by
+//     either its private or its public hash.
+//   - Postgres + S3            -> the filesystem is the store (hash = filename)
+//   - Full ajv JSON Schema     -> a ~30-line structural validator
 //   - ARK identifiers, mirror sync, SQL query console, discussion threads
 //
 // =============================================================================
 
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import {
   existsSync,
   mkdirSync,
@@ -230,24 +237,41 @@ function validateRecord(record, schema) {
   return errors
 }
 
+// Fields present in the record but not declared in the schema's properties.
+// The protocol rejects these (422) unless strip_unknown_fields is set.
+function findExtraFields(data, schema) {
+  const props = schema?.properties
+  if (!props || typeof data !== 'object' || data === null || Array.isArray(data)) return []
+  return Object.keys(data).filter((k) => !(k in props))
+}
+
+function stripToSchema(data, schema) {
+  const props = schema?.properties ?? {}
+  const out = {}
+  for (const k of Object.keys(data)) if (k in props) out[k] = data[k]
+  return out
+}
+
 // =============================================================================
 // CONTENT-ADDRESSED STORE. The filesystem is the database.
 //
 //   sus-data/
 //     records/<sha256>.json   one record object { id, type, data }
 //     schemas/<sha256>.json   one schema body
+//     files/<sha256>          one binary blob   (+ <sha256>.type = content type)
 //     collections/<owner>/<slug>/
 //       meta.json             { name, public, createdAt }
 //       v1.0.0.json           a version manifest (lists the hashes above)
 //
 // Deduplication is just "does this file already exist?". A version is a small
-// manifest that points at shared, content-addressed records and schemas.
+// manifest that points at shared, content-addressed records, schemas, and files.
 // =============================================================================
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const DATA = process.env.SUS_DATA || join(HERE, 'sus-data')
 const RECORDS = join(DATA, 'records')
 const SCHEMAS = join(DATA, 'schemas')
+const FILES = join(DATA, 'files')
 const COLLECTIONS = join(DATA, 'collections')
 
 // Hard cap on the on-disk store. This is a shared demo box, so the server
@@ -255,7 +279,7 @@ const COLLECTIONS = join(DATA, 'collections')
 const MAX_BYTES = Number(process.env.SUS_MAX_BYTES) || 1024 * 1024 * 1024
 
 function ensureDirs() {
-  for (const d of [RECORDS, SCHEMAS, COLLECTIONS]) mkdirSync(d, { recursive: true })
+  for (const d of [RECORDS, SCHEMAS, FILES, COLLECTIONS]) mkdirSync(d, { recursive: true })
 }
 
 function dirSize(dir) {
@@ -279,6 +303,19 @@ function storageInfo() {
   }
 }
 
+// Returns a 507 response when the store is at capacity, otherwise null.
+function storageFull() {
+  const storage = storageInfo()
+  if (!storage.full) return null
+  return {
+    status: 507,
+    json: {
+      error: `storage full. This demo is capped at ${storage.maxMB} MB. Delete a collection to free space.`,
+      storage,
+    },
+  }
+}
+
 // Delete a collection and sweep any records/schemas no other version still
 // references. Content addressing means the same record can be shared across
 // collections, so we only remove what has become unreferenced.
@@ -295,14 +332,21 @@ function deleteCollection(owner, slug) {
 
   const usedRecords = new Set()
   const usedSchemas = new Set()
+  const usedFiles = new Set()
   for (const c of listCollections()) {
     for (const v of listVersions(c.owner, c.slug)) {
-      for (const h of v.records ?? []) usedRecords.add(h)
+      for (const r of v.records ?? []) {
+        if (r.hash) usedRecords.add(r.hash)
+        if (r.publicHash) usedRecords.add(r.publicHash)
+      }
       for (const h of Object.values(v.schemas ?? {})) usedSchemas.add(h)
+      for (const h of Object.values(v.publicSchemas ?? {})) usedSchemas.add(h)
+      for (const h of v.files ?? []) usedFiles.add(h)
     }
   }
   let recordsRemoved = 0
   let schemasRemoved = 0
+  let filesRemoved = 0
   for (const f of existsSync(RECORDS) ? readdirSync(RECORDS) : []) {
     if (!usedRecords.has(f.replace(/\.json$/, ''))) {
       rmSync(join(RECORDS, f))
@@ -315,11 +359,17 @@ function deleteCollection(owner, slug) {
       schemasRemoved++
     }
   }
+  for (const f of existsSync(FILES) ? readdirSync(FILES) : []) {
+    if (!usedFiles.has(f.replace(/\.type$/, ''))) {
+      rmSync(join(FILES, f))
+      if (!f.endsWith('.type')) filesRemoved++
+    }
+  }
   return {
     status: 200,
     json: {
       deleted: `${owner}/${slug}`,
-      gc: { recordsRemoved, schemasRemoved },
+      gc: { recordsRemoved, schemasRemoved, filesRemoved },
       storage: storageInfo(),
     },
   }
@@ -337,6 +387,59 @@ function getContent(dir, hash) {
   const path = join(dir, `${hash}.json`)
   if (!existsSync(path)) return null
   return JSON.parse(readFileSync(path, 'utf-8'))
+}
+
+function recordExists(hash) {
+  return existsSync(join(RECORDS, `${hash}.json`))
+}
+
+// --- Files (content-addressed binary blobs) ---
+
+function hashBytes(buf) {
+  return createHash('sha256').update(buf).digest('hex')
+}
+
+// File hashes may travel with a "sha256:" prefix; storage keys never do.
+function normalizeFileHash(h) {
+  return String(h).replace(/^sha256:/, '')
+}
+
+function fileExists(hash) {
+  return existsSync(join(FILES, normalizeFileHash(hash)))
+}
+
+function putFile(hash, buf, mimeType) {
+  const h = normalizeFileHash(hash)
+  const existed = fileExists(h)
+  if (!existed) {
+    writeFileSync(join(FILES, h), buf)
+    writeFileSync(join(FILES, `${h}.type`), mimeType || 'application/octet-stream')
+  }
+  return existed
+}
+
+function getFile(hash) {
+  const h = normalizeFileHash(hash)
+  const path = join(FILES, h)
+  if (!existsSync(path)) return null
+  const buf = readFileSync(path)
+  const typePath = join(FILES, `${h}.type`)
+  const mimeType = existsSync(typePath)
+    ? readFileSync(typePath, 'utf-8')
+    : 'application/octet-stream'
+  return { buf, mimeType, size: buf.length }
+}
+
+// Collect every {"$file":"sha256:..."} reference reachable in a record's data.
+function extractFileRefs(value, out = new Set()) {
+  if (value === null || typeof value !== 'object') return out
+  if (Array.isArray(value)) {
+    for (const v of value) extractFileRefs(v, out)
+    return out
+  }
+  if (typeof value.$file === 'string') out.add(normalizeFileHash(value.$file))
+  for (const v of Object.values(value)) extractFileRefs(v, out)
+  return out
 }
 
 function validSlug(s) {
@@ -440,34 +543,93 @@ function sameSet(a, b) {
   return true
 }
 
-// One-shot push. The real server splits this into negotiate/upload/commit so
-// clients skip re-uploading content the server already has; here we accept it
-// all and report what was deduplicated. The version hash is identical either way.
-function pushVersion(owner, slug, body) {
+// --- Read views (owner) ---
+//
+// SUS has no authentication and lets anyone read, write, and delete, so it
+// treats every caller as the collection owner: reads return the full view,
+// including private types, private records, and private fields. The public
+// hashes are still computed (they are part of a version's identity) and the
+// filtered public documents are still stored, so a record resolves by either
+// its private or its public hash — but nothing is hidden on read.
+
+function manifestRecords(version) {
+  return (version.records ?? []).map((r) => ({ id: r.id, type: r.type, hash: r.hash }))
+}
+
+function versionView(v) {
+  return {
+    semver: v.semver,
+    hash: v.hash,
+    publicHash: v.publicHash,
+    baseSemver: v.baseSemver,
+    message: v.message,
+    metadata: v.metadata ?? null,
+    schemas: v.schemas ?? {},
+    recordCount: (v.records ?? []).length,
+    fileCount: (v.files ?? []).length,
+    createdAt: v.createdAt,
+  }
+}
+
+function diffManifests(fromRecords, toRecords) {
+  const fromById = new Map(fromRecords.map((r) => [r.id, r]))
+  const toById = new Map(toRecords.map((r) => [r.id, r]))
+  const added = []
+  const updated = []
+  const removed = []
+  for (const r of toRecords) {
+    const f = fromById.get(r.id)
+    if (!f) added.push(r)
+    else if (f.hash !== r.hash) updated.push({ ...r, previousHash: f.hash })
+  }
+  for (const r of fromRecords) if (!toById.has(r.id)) removed.push(r)
+  return { added, updated, removed }
+}
+
+// Shared commit path. Validates, stores content-addressed schemas/records/files
+// (plus public projections), enforces optimistic locking on base_version,
+// derives the semver, and writes the immutable version manifest. Both the
+// one-shot /push and the negotiate /commit funnel through here, so they produce
+// byte-identical version hashes.
+function commitVersion(opts) {
+  const {
+    owner,
+    slug,
+    schemas: schemasIn = {},
+    records: recordsIn = [],
+    fileHashes = [],
+    baseSemver = null,
+    message = null,
+    metadata = null,
+    appId = null,
+    actorId = null,
+    stripUnknownFields = false,
+  } = opts
+
   if (!getMeta(owner, slug)) {
     return { status: 404, json: { error: `collection ${owner}/${slug} not found` } }
   }
-  const storage = storageInfo()
-  if (storage.full) {
-    return {
-      status: 507,
-      json: {
-        error: `storage full. This demo is capped at ${storage.maxMB} MB. Delete an old collection to free space.`,
-        storage,
-      },
-    }
-  }
-  const schemasIn = body?.schemas ?? {} // { typeSlug: schemaBody }
-  const recordsIn = body?.records ?? [] // [{ id, type, data, private? }]
-  const metadata = body?.metadata ?? null
-  const message = body?.message ?? null
-
+  const full = storageFull()
+  if (full) return full
   if (!recordsIn.length && !Object.keys(schemasIn).length) {
     return { status: 422, json: { error: 'push must include at least one schema or record' } }
   }
 
-  // 1. Validate every record against its declared type schema.
+  // Optimistic locking: base_version must match the current latest version.
+  const versions = listVersions(owner, slug)
+  const prev = versions.length ? versions[versions.length - 1] : null
+  const currentSemver = prev?.semver ?? null
+  if ((baseSemver ?? null) !== currentSemver) {
+    return {
+      status: 409,
+      json: { error: 'Version conflict', currentVersion: currentSemver, statusCode: 409 },
+    }
+  }
+
+  // Validate against schemas; collect extra fields (reject, or strip on request).
   const errors = []
+  const extraByRecord = []
+  const cleaned = [] // { id, type, data, private }
   for (const rec of recordsIn) {
     if (!rec.id || !rec.type) {
       errors.push('every record needs an "id" and a "type"')
@@ -479,12 +641,45 @@ function pushVersion(owner, slug, body) {
       continue
     }
     for (const e of validateRecord(rec, schema)) errors.push(`${rec.id}: ${e}`)
+    let data = rec.data
+    const extra = findExtraFields(rec.data, schema)
+    if (extra.length) {
+      if (stripUnknownFields) data = stripToSchema(rec.data, schema)
+      else extraByRecord.push({ recordId: rec.id, type: rec.type, fields: extra })
+    }
+    cleaned.push({ id: rec.id, type: rec.type, data, private: rec.private === true })
   }
   if (errors.length) return { status: 422, json: { error: 'validation failed', errors } }
+  if (extraByRecord.length) {
+    return {
+      status: 422,
+      json: {
+        error: 'Records contain fields not defined in schema',
+        extraFields: extraByRecord,
+        statusCode: 422,
+      },
+    }
+  }
 
-  // 2. Store schemas content-addressed (dedup).
-  const schemaSet = [] // [{ slug, schemaHash }]
-  const schemaEntries = [] // [{ slug, schema }], for the public-hash computation
+  // Every referenced file ($file refs + declared file list) must already exist.
+  const referenced = new Set(fileHashes.map(normalizeFileHash))
+  for (const rec of cleaned) for (const h of extractFileRefs(rec.data)) referenced.add(h)
+  const missingFiles = [...referenced].filter((h) => !fileExists(h))
+  if (missingFiles.length) {
+    return {
+      status: 422,
+      json: {
+        error: 'Missing files',
+        filesNeeded: missingFiles.map((h) => `sha256:${h}`),
+        statusCode: 422,
+      },
+    }
+  }
+  const allFiles = [...referenced]
+
+  // Store schemas (full) and their public projections.
+  const schemaSet = []
+  const schemaEntries = []
   let schemasNew = 0
   for (const [typeSlug, schemaBody] of Object.entries(schemasIn)) {
     const h = hashSchema(schemaBody)
@@ -492,42 +687,58 @@ function pushVersion(owner, slug, body) {
     schemaSet.push({ slug: typeSlug, schemaHash: h })
     schemaEntries.push({ slug: typeSlug, schema: schemaBody })
   }
+  const privateTypes = getPrivateTypes(schemaEntries)
+  const publicSchemas = {}
+  for (const entry of schemaEntries) {
+    if (privateTypes.has(entry.slug)) continue
+    const filtered = filterTypeSchema(entry.schema)
+    const ph = hashSchema(filtered)
+    putContent(SCHEMAS, ph, filtered)
+    publicSchemas[entry.slug] = ph
+  }
 
-  // 3. Store records content-addressed (dedup).
+  // Store records (full) and, when a type has private fields, the public
+  // projection under its public hash so public readers can resolve it.
   const recordHashes = []
   const recordRows = []
+  const manifestRecords = []
   let recordsNew = 0
-  for (const rec of recordsIn) {
+  for (const rec of cleaned) {
     const { hash } = hashRecord({ id: rec.id, type: rec.type, data: rec.data })
     if (!putContent(RECORDS, hash, { id: rec.id, type: rec.type, data: rec.data })) recordsNew++
     recordHashes.push(hash)
-    recordRows.push({
-      recordId: rec.id,
-      type: rec.type,
-      data: rec.data,
-      private: rec.private === true,
-    })
+    recordRows.push({ recordId: rec.id, type: rec.type, data: rec.data, private: rec.private })
+
+    const privFields = getPrivateFields(schemasIn[rec.type] ?? {})
+    const pubData = privFields.size ? filterRecordData(rec.data, privFields) : rec.data
+    const publicHash = privFields.size
+      ? hashRecord({ id: rec.id, type: rec.type, data: pubData }).hash
+      : hash
+    if (publicHash !== hash) {
+      putContent(RECORDS, publicHash, { id: rec.id, type: rec.type, data: pubData })
+    }
+    manifestRecords.push({ id: rec.id, type: rec.type, hash, publicHash, private: rec.private })
   }
   const uniqueRecordHashes = [...new Set(recordHashes)]
 
-  // 4. Compare against the previous version to decide the semver bump.
-  const versions = listVersions(owner, slug)
-  const prev = versions.length ? versions[versions.length - 1] : null
-  const schemaChanged = !prev || !sameSchemas(prev.schemas, schemaSet)
-  const recordsChanged = !prev || !sameSet(prev.records ?? [], uniqueRecordHashes)
-
-  // 5. The content-address of the whole version.
-  const fileHashes = [] // files are out of scope for SUS
-  const versionHash = computeVersionHash(schemaSet, uniqueRecordHashes, fileHashes, metadata)
+  const versionHash = computeVersionHash(schemaSet, uniqueRecordHashes, allFiles, metadata)
   if (prev && prev.hash === versionHash) {
     return {
       status: 409,
       json: { error: `no changes. Identical content to ${prev.semver}`, hash: versionHash },
     }
   }
+  const publicHash = computePublicHash(schemaEntries, recordRows, allFiles, metadata)
 
+  const schemaChanged = !prev || !sameSchemas(prev.schemas, schemaSet)
+  const recordsChanged =
+    !prev ||
+    !sameSet(
+      (prev.records ?? []).map((r) => r.hash),
+      uniqueRecordHashes,
+    ) ||
+    !sameSet(prev.files ?? [], allFiles)
   const next = deriveSemver(prev?.semver ?? null, schemaChanged, recordsChanged)
-  const publicHash = computePublicHash(schemaEntries, recordRows, fileHashes, metadata)
 
   const manifest = {
     semver: next.semver,
@@ -539,11 +750,14 @@ function pushVersion(owner, slug, body) {
     baseSemver: prev?.semver ?? null,
     message,
     metadata,
+    appId,
+    actorId,
     schemas: Object.fromEntries(schemaSet.map((s) => [s.slug, s.schemaHash])),
-    records: uniqueRecordHashes,
-    files: fileHashes,
-    recordCount: uniqueRecordHashes.length,
-    fileCount: 0,
+    publicSchemas,
+    records: manifestRecords,
+    files: allFiles,
+    recordCount: manifestRecords.length,
+    fileCount: allFiles.length,
     createdAt: new Date().toISOString(),
   }
   writeVersion(owner, slug, manifest)
@@ -551,12 +765,8 @@ function pushVersion(owner, slug, body) {
   return {
     status: 200,
     json: {
-      version: versionSummary(manifest),
-      bump: schemaChanged
-        ? 'major (schema changed)'
-        : recordsChanged
-          ? 'minor (records changed)'
-          : 'patch',
+      manifest,
+      bump: schemaChanged ? 'major' : recordsChanged ? 'minor' : 'patch',
       dedup: {
         recordsReceived: recordsIn.length,
         recordsStored: recordsNew,
@@ -565,6 +775,313 @@ function pushVersion(owner, slug, body) {
       },
     },
   }
+}
+
+// One-shot push (convenience, used by the web console). Defaults base_version to
+// the current latest so the simple path never conflicts; a real client uses the
+// negotiate flow below. Both share commitVersion, so hashes are identical.
+function pushVersion(owner, slug, body) {
+  const latest = listVersions(owner, slug).slice(-1)[0]?.semver ?? null
+  const result = commitVersion({
+    owner,
+    slug,
+    schemas: body?.schemas ?? {},
+    records: body?.records ?? [],
+    fileHashes: body?.files ?? [],
+    baseSemver: body?.base_version ?? body?.baseSemver ?? latest,
+    message: body?.message ?? null,
+    metadata: body?.metadata ?? null,
+    appId: body?.app_id ?? null,
+    actorId: body?.actor_id ?? null,
+    stripUnknownFields: body?.strip_unknown_fields === true,
+  })
+  if (result.status !== 200) return result
+  const { manifest, bump, dedup } = result.json
+  return { status: 200, json: { version: versionSummary(manifest), bump, dedup } }
+}
+
+// =============================================================================
+// PUSH: the negotiate protocol (negotiate -> send records -> commit).
+// Sessions are in-memory and expire after 10 minutes, per the spec.
+// =============================================================================
+
+const SESSION_TTL_MS = 10 * 60 * 1000
+const sessions = new Map()
+
+function pruneSessions() {
+  const now = Date.now()
+  for (const [id, s] of sessions) if (s.expiresAt <= now) sessions.delete(id)
+}
+
+function getSession(owner, slug, sessionId) {
+  pruneSessions()
+  const s = sessions.get(sessionId)
+  if (!s || s.owner !== owner || s.slug !== slug) return null
+  return s
+}
+
+function negotiate(owner, slug, body) {
+  if (!getMeta(owner, slug)) {
+    return { status: 404, json: { error: `collection ${owner}/${slug} not found` } }
+  }
+  pruneSessions()
+  const manifest = body?.manifest ?? [] // [{ id, type, hash, private? }]
+  const files = (body?.files ?? []).map(normalizeFileHash)
+  const neededRecords = manifest.filter((m) => !recordExists(m.hash)).map((m) => m.hash)
+  const neededFiles = files.filter((h) => !fileExists(h))
+
+  const id = randomUUID()
+  sessions.set(id, {
+    owner,
+    slug,
+    baseSemver: body?.base_version ?? null,
+    schemas: body?.schemas ?? {},
+    manifest,
+    files,
+    message: body?.message ?? null,
+    metadata: body?.metadata ?? null,
+    appId: body?.app_id ?? null,
+    actorId: body?.actor_id ?? null,
+    stripUnknownFields: body?.strip_unknown_fields === true,
+    needed: new Set(neededRecords),
+    expiresAt: Date.now() + SESSION_TTL_MS,
+  })
+  return {
+    status: 200,
+    json: {
+      session_id: id,
+      needed_records: neededRecords,
+      needed_files: neededFiles.map((h) => `sha256:${h}`),
+      total_records: manifest.length,
+      total_files: files.length,
+      already_have_records: manifest.length - neededRecords.length,
+      already_have_files: files.length - neededFiles.length,
+    },
+  }
+}
+
+function negotiateRecords(owner, slug, sessionId, ndjson) {
+  const s = getSession(owner, slug, sessionId)
+  if (!s) return { status: 404, json: { error: 'session not found or expired' } }
+  const lines = ndjson
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+  let received = 0
+  for (const line of lines) {
+    let rec
+    try {
+      rec = JSON.parse(line)
+    } catch {
+      return { status: 400, json: { error: 'invalid JSONL line' } }
+    }
+    if (!rec || !rec.id || !rec.type) {
+      return { status: 400, json: { error: 'record missing id/type' } }
+    }
+    const { hash } = hashRecord({ id: rec.id, type: rec.type, data: rec.data })
+    if (s.needed.has(hash)) {
+      putContent(RECORDS, hash, { id: rec.id, type: rec.type, data: rec.data })
+      s.needed.delete(hash)
+      received++
+    } else if (!s.manifest.some((m) => m.hash === hash)) {
+      return { status: 400, json: { error: 'Unexpected record hash', hash, statusCode: 400 } }
+    }
+  }
+  return { status: 200, json: { received, remaining: s.needed.size } }
+}
+
+function negotiateCommit(owner, slug, sessionId) {
+  const s = getSession(owner, slug, sessionId)
+  if (!s) return { status: 404, json: { error: 'session not found or expired' } }
+  if (s.needed.size) {
+    return {
+      status: 400,
+      json: { error: 'Missing records', missing_hashes: [...s.needed], statusCode: 400 },
+    }
+  }
+  // Rebuild the full record set from the content store (everything is present now).
+  const records = []
+  for (const m of s.manifest) {
+    const doc = getContent(RECORDS, m.hash)
+    if (!doc) {
+      return {
+        status: 400,
+        json: { error: 'Missing records', missing_hashes: [m.hash], statusCode: 400 },
+      }
+    }
+    records.push({ id: doc.id, type: doc.type, data: doc.data, private: m.private === true })
+  }
+  const result = commitVersion({
+    owner,
+    slug,
+    schemas: s.schemas,
+    records,
+    fileHashes: s.files,
+    baseSemver: s.baseSemver,
+    message: s.message,
+    metadata: s.metadata,
+    appId: s.appId,
+    actorId: s.actorId,
+    stripUnknownFields: s.stripUnknownFields,
+  })
+  if (result.status !== 200) return result
+  sessions.delete(sessionId)
+  const m = result.json.manifest
+  return {
+    status: 201,
+    json: { semver: m.semver, hash: m.hash, recordCount: m.recordCount, fileCount: m.fileCount },
+  }
+}
+
+function sessionStatus(owner, slug, sessionId) {
+  const s = getSession(owner, slug, sessionId)
+  if (!s) return { status: 404, json: { error: 'session not found or expired' } }
+  return {
+    status: 200,
+    json: {
+      session_id: sessionId,
+      total_records: s.manifest.length,
+      needed_records: [...s.needed],
+      remaining: s.needed.size,
+      expiresAt: new Date(s.expiresAt).toISOString(),
+    },
+  }
+}
+
+function cancelSession(owner, slug, sessionId) {
+  const s = getSession(owner, slug, sessionId)
+  if (!s) return { status: 404, json: { error: 'session not found or expired' } }
+  sessions.delete(sessionId)
+  return { status: 204, json: null }
+}
+
+// =============================================================================
+// FILES, PULL, PROVENANCE, FORK
+// =============================================================================
+
+function uploadFile(owner, slug, hashParam, buf, mimeType) {
+  if (!getMeta(owner, slug)) {
+    return { status: 404, json: { error: `collection ${owner}/${slug} not found` } }
+  }
+  const full = storageFull()
+  if (full) return full
+  const want = normalizeFileHash(hashParam)
+  const got = hashBytes(buf)
+  if (got !== want) {
+    return {
+      status: 400,
+      json: { error: 'hash mismatch', expected: want, actual: got, statusCode: 400 },
+    }
+  }
+  const existed = putFile(got, buf, mimeType)
+  return {
+    status: existed ? 200 : 201,
+    json: { hash: `sha256:${got}`, size: buf.length, deduplicated: existed },
+  }
+}
+
+function listVersionFiles(owner, slug, semver) {
+  const v = findVersion(owner, slug, semver)
+  if (!v) return { status: 404, json: { error: 'version not found' } }
+  const files = (v.files ?? []).map((h) => {
+    const f = getFile(h)
+    return { hash: `sha256:${h}`, size: f?.size ?? null, contentType: f?.mimeType ?? null }
+  })
+  return { status: 200, json: { semver: v.semver, files } }
+}
+
+function getManifest(owner, slug, semver, since) {
+  const v = findVersion(owner, slug, semver)
+  if (!v) return { status: 404, json: { error: 'version not found' } }
+  const records = manifestRecords(v)
+  if (since) {
+    const from = findVersion(owner, slug, since)
+    if (!from) return { status: 404, json: { error: `since version ${since} not found` } }
+    return {
+      status: 200,
+      json: {
+        version: v.semver,
+        since: from.semver,
+        delta: diffManifests(manifestRecords(from), records),
+      },
+    }
+  }
+  return {
+    status: 200,
+    json: {
+      semver: v.semver,
+      hash: v.hash,
+      schemas: v.schemas ?? {},
+      records,
+      files: (v.files ?? []).map((h) => `sha256:${h}`),
+    },
+  }
+}
+
+function getDiff(owner, slug, semver, from) {
+  const to = findVersion(owner, slug, semver)
+  if (!to) return { status: 404, json: { error: 'version not found' } }
+  const fromV = findVersion(owner, slug, from)
+  if (!fromV) return { status: 404, json: { error: `from version ${from} not found` } }
+  const d = diffManifests(manifestRecords(fromV), manifestRecords(to))
+  return { status: 200, json: { from: fromV.semver, to: to.semver, ...d } }
+}
+
+function provenance(hash) {
+  const references = []
+  let recordId = null
+  let type = null
+  let firstSeen = null
+  for (const c of listCollections()) {
+    for (const v of listVersions(c.owner, c.slug)) {
+      for (const r of v.records ?? []) {
+        if (r.hash !== hash && r.publicHash !== hash) continue
+        references.push({ owner: c.owner, collection: c.slug, version: v.semver })
+        recordId = r.id
+        type = r.type
+        if (!firstSeen || v.createdAt < firstSeen) firstSeen = v.createdAt
+      }
+    }
+  }
+  if (!references.length) return { status: 404, json: { error: 'record not found' } }
+  return { status: 200, json: { hash, recordId, type, firstSeen, references } }
+}
+
+// Fork copies only the manifest (records/schemas/files are referenced, not
+// duplicated). Without orgs, targetOrg is just the new owner slug.
+function forkCollection(owner, slug, body) {
+  const meta = getMeta(owner, slug)
+  if (!meta) return { status: 404, json: { error: 'collection not found' } }
+  const targetOwner = body?.targetOrg ?? owner
+  const targetSlug = body?.slug ?? slug
+  if (!validSlug(targetOwner) || !validSlug(targetSlug)) {
+    return { status: 422, json: { error: 'targetOrg and slug must match /^[a-z0-9][a-z0-9-]*$/' } }
+  }
+  if (getMeta(targetOwner, targetSlug)) {
+    return {
+      status: 409,
+      json: { error: `collection ${targetOwner}/${targetSlug} already exists` },
+    }
+  }
+  const latest = listVersions(owner, slug).slice(-1)[0] ?? null
+  const dir = collDir(targetOwner, targetSlug)
+  mkdirSync(dir, { recursive: true })
+  const forkedFrom = { owner, slug, version: latest?.semver ?? null }
+  writeFileSync(
+    join(dir, 'meta.json'),
+    JSON.stringify(
+      {
+        name: body?.name || meta.name,
+        public: true,
+        createdAt: new Date().toISOString(),
+        forkedFrom,
+      },
+      null,
+      2,
+    ),
+  )
+  if (latest) writeVersion(targetOwner, targetSlug, { ...latest })
+  return { status: 200, json: { owner: targetOwner, slug: targetSlug, forkedFrom } }
 }
 
 // =============================================================================
@@ -585,6 +1102,32 @@ function readJson(req) {
         reject(new Error('invalid JSON body'))
       }
     })
+    req.on('error', reject)
+  })
+}
+
+function readBytes(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let len = 0
+    req.on('data', (c) => {
+      chunks.push(c)
+      len += c.length
+      if (len > 200_000_000) reject(new Error('request body too large'))
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
+}
+
+function readText(req) {
+  return new Promise((resolve, reject) => {
+    let data = ''
+    req.on('data', (c) => {
+      data += c
+      if (data.length > 200_000_000) reject(new Error('request body too large'))
+    })
+    req.on('end', () => resolve(data))
     req.on('error', reject)
   })
 }
@@ -615,6 +1158,10 @@ function match(pattern, pathname) {
   return params
 }
 
+// JSON routes (GET / POST / DELETE). Binary and NDJSON routes (file
+// upload/download, negotiate record batches, /records/batch) are handled
+// explicitly in the dispatcher below. Negotiate routes are listed before the
+// generic /versions/:semver routes so a literal "negotiate" segment wins.
 const routes = [
   [
     'GET',
@@ -623,11 +1170,8 @@ const routes = [
   ],
 
   ['GET', '/api/collections', () => ({ status: 200, json: { collections: listCollections() } })],
-
   ['POST', '/api/collections', (_p, body) => createCollection(body)],
-
   ['DELETE', '/api/collections/:owner/:slug', ({ owner, slug }) => deleteCollection(owner, slug)],
-
   [
     'GET',
     '/api/collections/:owner/:slug',
@@ -646,28 +1190,76 @@ const routes = [
     '/api/collections/:owner/:slug/push',
     ({ owner, slug }, body) => pushVersion(owner, slug, body),
   ],
-
   [
-    'GET',
-    '/api/collections/:owner/:slug/versions/:semver',
-    ({ owner, slug, semver }) => {
-      const v = findVersion(owner, slug, semver)
-      if (!v) return { status: 404, json: { error: 'version not found' } }
-      return { status: 200, json: v }
-    },
+    'POST',
+    '/api/collections/:owner/:slug/fork',
+    ({ owner, slug }, body) => forkCollection(owner, slug, body),
   ],
 
+  // Push: negotiate protocol
+  [
+    'POST',
+    '/api/collections/:owner/:slug/versions/negotiate',
+    ({ owner, slug }, body) => negotiate(owner, slug, body),
+  ],
+  [
+    'POST',
+    '/api/collections/:owner/:slug/versions/negotiate/:sessionId/commit',
+    ({ owner, slug, sessionId }) => negotiateCommit(owner, slug, sessionId),
+  ],
+  [
+    'GET',
+    '/api/collections/:owner/:slug/versions/negotiate/:sessionId',
+    ({ owner, slug, sessionId }) => sessionStatus(owner, slug, sessionId),
+  ],
+  [
+    'DELETE',
+    '/api/collections/:owner/:slug/versions/negotiate/:sessionId',
+    ({ owner, slug, sessionId }) => cancelSession(owner, slug, sessionId),
+  ],
+
+  // Pull
+  [
+    'GET',
+    '/api/collections/:owner/:slug/versions/:semver/manifest',
+    ({ owner, slug, semver }, _b, url) =>
+      getManifest(owner, slug, semver, url.searchParams.get('since')),
+  ],
+  [
+    'GET',
+    '/api/collections/:owner/:slug/versions/:semver/diff',
+    ({ owner, slug, semver }, _b, url) =>
+      getDiff(owner, slug, semver, url.searchParams.get('from')),
+  ],
+  [
+    'GET',
+    '/api/collections/:owner/:slug/versions/:semver/files',
+    ({ owner, slug, semver }) => listVersionFiles(owner, slug, semver),
+  ],
   [
     'GET',
     '/api/collections/:owner/:slug/versions/:semver/records',
     ({ owner, slug, semver }) => {
       const v = findVersion(owner, slug, semver)
       if (!v) return { status: 404, json: { error: 'version not found' } }
-      const records = v.records.map((h) => getContent(RECORDS, h)).filter(Boolean)
+      const records = manifestRecords(v)
+        .map((r) => getContent(RECORDS, r.hash))
+        .filter(Boolean)
       return { status: 200, json: { semver: v.semver, records } }
     },
   ],
+  [
+    'GET',
+    '/api/collections/:owner/:slug/versions/:semver',
+    ({ owner, slug, semver }) => {
+      const v = findVersion(owner, slug, semver)
+      if (!v) return { status: 404, json: { error: 'version not found' } }
+      return { status: 200, json: versionView(v) }
+    },
+  ],
 
+  // Global content-addressed reads. Any stored hash resolves (everyone is owner).
+  ['GET', '/api/records/:hash/provenance', ({ hash }) => provenance(normalizeFileHash(hash))],
   [
     'GET',
     '/api/records/:hash',
@@ -676,7 +1268,6 @@ const routes = [
       return rec ? { status: 200, json: rec } : { status: 404, json: { error: 'record not found' } }
     },
   ],
-
   [
     'GET',
     '/api/schemas/:hash',
@@ -689,13 +1280,15 @@ const routes = [
   ],
 ]
 
+const CORS = { 'Access-Control-Allow-Origin': '*' }
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      ...CORS,
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, HEAD, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     })
     return res.end()
@@ -708,24 +1301,73 @@ const server = createServer(async (req, res) => {
     if (page) return sendHtml(res, page.status, page.html)
   }
 
-  for (const [method, pattern, handler] of routes) {
-    if (method !== req.method) continue
-    const params = match(pattern, url.pathname)
-    if (!params) continue
-    let body = null
-    if (req.method === 'POST') {
-      try {
-        body = await readJson(req)
-      } catch (e) {
-        return sendJson(res, 400, { error: e.message })
+  try {
+    // --- Files: binary upload/download (content-addressed) ---
+    const fileMatch = match('/api/collections/:owner/:slug/files/:hash', url.pathname)
+    if (fileMatch && (req.method === 'PUT' || req.method === 'GET' || req.method === 'HEAD')) {
+      const { owner, slug, hash } = fileMatch
+      if (req.method === 'PUT') {
+        const buf = await readBytes(req)
+        const r = uploadFile(owner, slug, hash, buf, req.headers['content-type'])
+        return sendJson(res, r.status, r.json)
       }
+      const f = getFile(hash)
+      if (!f) {
+        if (req.method === 'HEAD') {
+          res.writeHead(404, CORS)
+          return res.end()
+        }
+        return sendJson(res, 404, { error: 'file not found' })
+      }
+      res.writeHead(200, { ...CORS, 'Content-Type': f.mimeType, 'Content-Length': f.size })
+      return res.end(req.method === 'HEAD' ? undefined : f.buf)
     }
-    try {
+
+    // --- Negotiate: receive records as NDJSON ---
+    const recMatch = match(
+      '/api/collections/:owner/:slug/versions/negotiate/:sessionId/records',
+      url.pathname,
+    )
+    if (recMatch && req.method === 'POST') {
+      const text = await readText(req)
+      const r = negotiateRecords(recMatch.owner, recMatch.slug, recMatch.sessionId, text)
+      return sendJson(res, r.status, r.json)
+    }
+
+    // --- Batch record fetch -> NDJSON stream ---
+    if (url.pathname === '/api/records/batch' && req.method === 'POST') {
+      const body = await readJson(req)
+      const lines = (body?.hashes ?? [])
+        .map(normalizeFileHash)
+        .map((h) => getContent(RECORDS, h))
+        .filter(Boolean)
+        .map((rec) => JSON.stringify(rec))
+      res.writeHead(200, { ...CORS, 'Content-Type': 'application/x-ndjson; charset=utf-8' })
+      return res.end(lines.length ? lines.join('\n') + '\n' : '')
+    }
+
+    // --- Generic JSON routes ---
+    for (const [method, pattern, handler] of routes) {
+      if (method !== req.method) continue
+      const params = match(pattern, url.pathname)
+      if (!params) continue
+      let body = null
+      if (req.method === 'POST') {
+        try {
+          body = await readJson(req)
+        } catch (e) {
+          return sendJson(res, 400, { error: e.message })
+        }
+      }
       const { status, json } = handler(params, body, url)
+      if (json === null || status === 204) {
+        res.writeHead(status, CORS)
+        return res.end()
+      }
       return sendJson(res, status, json)
-    } catch (e) {
-      return sendJson(res, 500, { error: String(e?.message ?? e) })
     }
+  } catch (e) {
+    return sendJson(res, 500, { error: String(e?.message ?? e) })
   }
 
   return sendJson(res, 404, { error: 'not found' })
@@ -747,7 +1389,7 @@ function esc(s) {
 
 // A black dot centered on white, inlined as an SVG data URI (no asset file).
 const FAVICON =
-  "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20fill='white'/%3E%3Ccircle%20cx='16'%20cy='16'%20r='8'%20fill='black'/%3E%3C/svg%3E"
+  "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20fill='white'/%3E%3Ccircle%20cx='16'%20cy='16'%20r='5'%20fill='black'/%3E%3C/svg%3E"
 
 function layout(title, body) {
   return `<!doctype html>
@@ -883,7 +1525,9 @@ function collectionPage(owner, slug) {
         .join('') +
       '</ul>'
     const latest = versions[versions.length - 1]
-    const records = latest.records.map((h) => getContent(RECORDS, h)).filter(Boolean)
+    const records = manifestRecords(latest)
+      .map((r) => getContent(RECORDS, r.hash))
+      .filter(Boolean)
     recordsHtml = `<h2>Records in ${esc(latest.semver)}</h2>
 <pre>${esc(JSON.stringify(records, null, 2))}</pre>`
   }
