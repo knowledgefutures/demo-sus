@@ -1399,6 +1399,9 @@ function layout(title, body) {
 ${body}`
 }
 
+// Shown at the top of every page except the home page.
+const BACK_HOME = '<p><a href="/">← Back to Home</a></p>'
+
 function homePage() {
   const s = storageInfo()
   const cols = listCollections()
@@ -1479,7 +1482,8 @@ function newPage() {
     status: 200,
     html: layout(
       'New collection · SUS',
-      `<h1>Create a collection</h1>
+      `${BACK_HOME}
+<h1>Create a collection</h1>
 <p>owner <input id="owner" value="demo"></p>
 <p>slug &nbsp;<input id="slug" value="people"></p>
 <p>name <input id="name" value="People"></p>
@@ -1536,7 +1540,8 @@ function collectionPage(owner, slug) {
     status: 200,
     html: layout(
       `${owner}/${slug} · SUS`,
-      `<h1>${esc(owner)}/${esc(slug)}</h1>
+      `${BACK_HOME}
+<h1>${esc(owner)}/${esc(slug)}</h1>
 <p>${esc(meta.name)}</p>
 <p><a href="/c/${esc(owner)}/${esc(slug)}/push">push a version →</a></p>
 
@@ -1570,7 +1575,8 @@ function pushPage(owner, slug) {
     status: 200,
     html: layout(
       `Push to ${owner}/${slug} · SUS`,
-      `<h1>Push a version</h1>
+      `${BACK_HOME}
+<h1>Push a version</h1>
 <p>to <a href="/c/${esc(owner)}/${esc(slug)}">${esc(owner)}/${esc(slug)}</a></p>
 <p>Body: a JSON Schema per type, plus records. A field or whole type marked
 <code>"private": true</code> is stripped from the public hash. Watch
@@ -1612,7 +1618,8 @@ function notFoundPage(message) {
     status: 404,
     html: layout(
       'Not found · SUS',
-      `<h1>Not found</h1><p>${esc(message || 'No such page.')}</p><p><a href="/">← home</a></p>`,
+      `${BACK_HOME}
+<h1>Not found</h1><p>${esc(message || 'No such page.')}</p>`,
     ),
   }
 }
