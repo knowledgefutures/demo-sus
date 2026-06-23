@@ -21,10 +21,17 @@ A public instance runs at **[sus.knowledgefutures.org](https://sus.knowledgefutu
 
 Hand your agent a prompt like this:
 
-> The server at https://sus.knowledgefutures.org is an Underlay node. Read
-> https://sus.knowledgefutures.org for its API, then create a collection and
-> push some JSON records with a JSON Schema. It needs no authentication. Do not
-> include any private or sensitive data. Everything you push is public.
+> The server at https://sus.knowledgefutures.org is an Underlay node: an HTTP API
+> for versioned, content-addressed structured data. Its complete API is its source
+> file (read it as plain text):
+> https://raw.githubusercontent.com/knowledgefutures/demo-sus/main/sus.mjs
+> Read that, then create a collection at https://sus.knowledgefutures.org and push
+> some JSON records with a JSON Schema. No authentication is needed. Do not include
+> anything private or sensitive — everything you push is public.
+
+The source is the spec — the `routes` table lists every endpoint and the
+operation functions show each request/response shape, so an agent gets the exact
+(auth-less, owner-view) contract with no drift.
 
 ---
 
