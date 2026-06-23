@@ -1472,7 +1472,7 @@ include any private or sensitive data. Everything you push is public.</pre>
 <p><small>This page is server-rendered HTML; the same data is available as JSON
 under <code>/api</code> (start at <code>/api/collections</code>). The whole
 server is one file you can
-<a href="https://github.com/knowledgefutures/demo-sus">read on GitHub</a>.</small></p>`,
+<a href="https://github.com/knowledgefutures/demo-sus/blob/main/sus.mjs">read on GitHub</a>.</small></p>`,
     ),
   }
 }
