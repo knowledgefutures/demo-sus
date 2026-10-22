@@ -62,7 +62,9 @@ jobs:
 
       # SUS has no runtime secrets, so the box just needs the repo + Docker.
       # Build on the host with docker compose (the image is one file copied into
-      # node:24.22.1-slim, so building there is faster than pushing through a registry).
+      # node:24-slim, so building there is faster than pushing through a registry).
+      # --pull, or the host keeps reusing its cached base image and never takes
+      # Node security releases.
       - name: Deploy over SSH
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
@@ -88,7 +90,8 @@ jobs:
           git checkout "${BRANCH}"
           git reset --hard "origin/${BRANCH}"
 
-          sudo docker compose up -d --build
+          sudo docker compose build --pull
+          sudo docker compose up -d
           sudo docker image prune -f
           sudo docker compose ps
           EOS

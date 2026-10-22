@@ -1,5 +1,5 @@
 # SUS is a single zero-dependency file. No install, no build.
-FROM node:24.22.1-slim AS production
+FROM node:24-slim AS production
 WORKDIR /app
 
 COPY sus.mjs ./
