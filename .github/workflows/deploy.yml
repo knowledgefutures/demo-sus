@@ -62,7 +62,7 @@ jobs:
 
       # SUS has no runtime secrets, so the box just needs the repo + Docker.
       # Build on the host with docker compose (the image is one file copied into
-      # node:24-slim, so building there is faster than pushing through a registry).
+      # node:24.22.1-slim, so building there is faster than pushing through a registry).
       - name: Deploy over SSH
         env:
           SSH_USER: ${{ secrets.SSH_USER }}
