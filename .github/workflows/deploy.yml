@@ -6,10 +6,7 @@ concurrency:
   group: deploy-sus
   cancel-in-progress: true
 
-# Push to main (or a dispatch on main) deploys production. The deploy target,
-# its host key and the SSH key come from the KF console (kf.project.jsonc:
-# production is deployed elsewhere, by this file), which hands them only to a
-# run on main that its deploy policy allows. SUS has no runtime values.
+# Deploys main; target and SSH key come from the KF console.
 on:
   push:
     branches: [main]
@@ -18,7 +15,6 @@ on:
 permissions: {}
 
 jobs:
-  # Runs the repo's code, so it gets no OIDC token.
   check:
     name: Syntax check
     runs-on: ubuntu-latest
@@ -39,7 +35,6 @@ jobs:
       - name: Syntax check
         run: node --check sus.mjs
 
-  # The one job with an OIDC token: it runs only kf and ssh.
   deploy:
     name: Deploy
     needs: check
@@ -58,16 +53,12 @@ jobs:
         with:
           node-version: 24
 
-      # The environment's SSH key into an ssh-agent, from a pipe, for an hour;
-      # DEPLOY_KNOWN_HOSTS into known_hosts (no ssh-keyscan); DEPLOY_HOST and
-      # DEPLOY_USER, checked, as outputs. All from the console, for this run.
       - name: Load the deploy key
         id: ssh
         run: $KF ci ssh-agent -e production
 
       # Build on the host with docker compose (the image is one file copied into
       # node:24-slim, so building there is faster than pushing through a registry).
-      # The box gets the commit this run is for, and nothing secret.
       - name: Deploy over SSH
         env:
           DEPLOY_USER: ${{ steps.ssh.outputs.DEPLOY_USER }}
