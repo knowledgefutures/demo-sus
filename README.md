@@ -257,30 +257,17 @@ Then `systemctl reload caddy`.
 
 ### Continuous deployment (GitHub Actions)
 
-[`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml) deploys on every push to `main` (and on manual dispatch). It mirrors the underlay setup: the deploy target is kept out of git in an sops-encrypted env file, decrypted in CI to learn which host to ship to. The workflow then SSHes to the box, pulls the repo into `/srv/sus`, and runs `docker compose up -d --build`.
+[`.github/workflows/deploy.yml`](./.github/workflows/deploy.yml) deploys on every push to `main` (and on a manual dispatch on `main`). The workflow SSHes to the box, checks out the pushed commit in `/srv/sus`, and runs `docker compose up -d --build`.
 
-One-time setup:
+Where it deploys and how it gets in come from the [KF console](https://console.knowledgefutures.org): `kf.project.jsonc` marks `production` as deployed elsewhere, by this workflow, and the console hands production's values and its SSH deploy key to a run on `main` that production's deploy policy allows (`kf ci ssh-agent`). Nothing is a GitHub secret. `.env.prod.enc` holds only where the deploy goes:
 
-1. Put the box's address in the encrypted env file (reuses the team age key, so
-   it decrypts with the same key as the underlay repo):
+| Key                  | Purpose                                                                           |
+| -------------------- | --------------------------------------------------------------------------------- |
+| `DEPLOY_HOST`        | the box's address                                                                 |
+| `DEPLOY_USER`        | the SSH user on the box                                                           |
+| `DEPLOY_KNOWN_HOSTS` | `<DEPLOY_HOST> ` and the box's `/etc/ssh/ssh_host_ed25519_key.pub`, so no keyscan |
 
-   ```bash
-   cp .env.prod.example .env.prod
-   # set DEPLOY_HOST to the box IP or hostname
-   npm run secrets:encrypt:prod
-   git add .env.prod.enc && git commit -m "add deploy host"
-   ```
-
-   (`npm run secrets:decrypt:prod` reverses it. The plaintext `.env.prod` is
-   gitignored; only `.env.prod.enc` is committed.)
-
-2. Add these repository secrets in GitHub (the same values the underlay repo uses):
-
-   | Secret                | Purpose                                     |
-   | --------------------- | ------------------------------------------- |
-   | `SOPS_AGE_SECRET_KEY` | age private key, to decrypt `.env.prod.enc` |
-   | `SSH_PRIVATE_KEY`     | key authorized on the box                   |
-   | `SSH_USER`            | SSH user on the box                         |
+One-time setup, as an owner or admin of the console's `kf` account: `kf link`, `kf secrets recipients sync`, `kf secrets deploy-policy -e production --ref heads/main --workflow .github/workflows/deploy.yml --github-environment production`, `kf secrets set DEPLOY_USER -e production` (and `DEPLOY_KNOWN_HOSTS`), then `kf secrets deploy-key -e production --make` and put the public line it prints in the user's `~/.ssh/authorized_keys` on the box.
 
 The box needs Docker and (for the first run) the host Caddy block above. The
 workflow clones over HTTPS, which assumes this repo is public; if it is made

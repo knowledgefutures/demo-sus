@@ -5,6 +5,15 @@
   "name": "Single-file Underlay Server (demo)",
   "account": "kf",
 
-  // No environments yet: the console registers the project and deploys
-  // nothing. Add "environments" (with at least "production") to deploy.
+  // Deployed by .github/workflows/deploy.yml, not by the console: the console
+  // keeps production's key and SSH deploy key, and hands them to that
+  // workflow's run on main (kf ci ssh-agent). .env.prod.enc holds only where
+  // the deploy goes: DEPLOY_HOST, DEPLOY_USER and DEPLOY_KNOWN_HOSTS.
+  "environments": {
+    "production": {
+      "ref": "heads/main",
+      "secrets": [".env.prod.enc"],
+      "elsewhere": { "workflow": ".github/workflows/deploy.yml" },
+    },
+  },
 }
