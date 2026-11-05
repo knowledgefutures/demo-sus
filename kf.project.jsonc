@@ -5,6 +5,12 @@
   "name": "Single-file Underlay Server (demo)",
   "account": "kf",
 
-  // No environments yet: the console registers the project and deploys
-  // nothing. Add "environments" (with at least "production") to deploy.
+  // Deployed by .github/workflows/deploy.yml with values from the console.
+  "environments": {
+    "production": {
+      "ref": "heads/main",
+      "secrets": [".env.prod.enc"],
+      "elsewhere": { "workflow": ".github/workflows/deploy.yml" },
+    },
+  },
 }
