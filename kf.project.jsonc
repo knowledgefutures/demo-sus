@@ -10,7 +10,7 @@
     "production": {
       "ref": "heads/main",
       "secrets": [".env.prod.enc"],
-      "elsewhere": { "workflow": ".github/workflows/deploy.yml" },
+      "elsewhere": { "workflow": ".github/workflows/deploy.yml", "hosts": ["sus.knowledgefutures.org"] },
     },
   },
 }
